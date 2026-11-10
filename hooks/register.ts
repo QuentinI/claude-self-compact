@@ -35,6 +35,12 @@ import type { EngineInterface as Engine, Register, SessionMessage } from 'claude
 // does not reset them. An aborted turn (the person pressed Stop) drops the
 // request. Every decision goes to the debug log and to
 // ~/.claude/self-compact/<session id>.log; only failures show in the transcript.
+//
+// Nudge: once the context passes `nudge` percent, and again at each further
+// `every` percent, the model reads a note beside its next tool result (or the
+// person's next prompt) suggesting a self-compaction, with an estimate of what
+// fills the context. Any compaction starts the steps over. No nudge while a
+// compaction is pending or a request would be refused.
 
 const TOOL = 'request_compaction'
 const FULL = 'mcp__self-compact__request_compaction'
@@ -53,6 +59,10 @@ const FIELDS = ['instructions', 'carry', 'resume']
 const ENVELOPE = ['tool', 'consent', 'tool_use_id', 'agentId', 'requestMeta']
 // Prompt origins that are the person's own message: they reset the resume count.
 const HUMAN = ['composer', 'bridge', 'sdk']
+// The context breakdown in a nudge is estimated from characters, not counted.
+const CHARS_PER_TOKEN = 4
+const MEDIA_TOKENS = 1600
+const NUDGE_TOP = 3
 
 type Job = { instructions?: string; carry?: string; resume?: string; carried?: boolean }
 let pending: Job | undefined   // requested, not started: replace and cancel act on it
@@ -61,10 +71,20 @@ let scheduled: Job | undefined // a turn.complete callback is working on it
 let openTurn: string | undefined // the main loop's running turn (subagents raise no turn.start)
 
 // interval in minutes (0: none); max self-compactions (0: no limit); resumes in a
-// row without a prompt from the person (0: resume is off).
-type Limits = { interval: number; max: number; resumes: number }
-type Session = { at: number; lastAt: number; count: number; resumes: number; limits: Partial<Limits> }
-const LIMIT_WORDS = { interval: 'interval', max: 'max', resumes: 'resumes' } as const
+// row without a prompt from the person (0: resume is off); nudge from this
+// percent of the context (0: off), again every `every` percent.
+type Limits = { interval: number; max: number; resumes: number; nudge: number; every: number }
+// nudgedAt: the context percent step last nudged at since the last compaction.
+type Session = {
+  at: number
+  lastAt: number
+  count: number
+  resumes: number
+  nudgedAt: number
+  limits: Partial<Limits>
+}
+const LIMIT_WORDS: (keyof Limits)[] = ['interval', 'max', 'resumes', 'nudge', 'every']
+const USAGE = `/self-compact [interval <min>] [max <n>] [resumes <n>] [nudge <%>] [every <%>] | reset`
 
 const PENDING_NOTE =
   'self-compact: the compaction you requested with request_compaction has not run yet. It ' +
@@ -116,7 +136,7 @@ async function log($: Engine, line: string, loud = false) {
 
 async function getSession($: Engine): Promise<Session> {
   const stored = (await $.store.get(SESSION_PREFIX + (await $.session.id()))) as Partial<Session> | undefined
-  return { at: 0, lastAt: 0, count: 0, resumes: 0, limits: {}, ...stored }
+  return { at: 0, lastAt: 0, count: 0, resumes: 0, nudgedAt: 0, limits: {}, ...stored }
 }
 
 async function putSession($: Engine, s: Session) {
@@ -222,8 +242,7 @@ async function compact($: Engine, job: Job, turnId: string) {
   }
 }
 
-// `/self-compact [interval <min>] [max <n>] [resumes <n>] | reset`: the words it
-// takes, or why not.
+// The /self-compact arguments (USAGE): the limits they set, or why not.
 function parseLimits(args: string): Partial<Limits> | 'reset' | { error: string } {
   const words = args.trim().split(/\s+/).filter(Boolean)
   if (words.length === 1 && words[0] === 'reset') return 'reset'
@@ -231,24 +250,134 @@ function parseLimits(args: string): Partial<Limits> | 'reset' | { error: string 
   for (let i = 0; i < words.length; i += 2) {
     const key = words[i] as keyof Limits
     const value = Number(words[i + 1])
-    if (!(key in LIMIT_WORDS)) return { error: `unknown limit "${words[i]}"` }
+    if (!LIMIT_WORDS.includes(key)) return { error: `unknown limit "${words[i]}"` }
     if (!Number.isFinite(value) || value < 0) return { error: `${key} needs a number of 0 or more` }
     out[key] = value
   }
   return out
 }
 
+const tokens = (chars: number) => {
+  const n = Math.round(chars / CHARS_PER_TOKEN)
+  return n >= 1000 ? `~${Math.round(n / 1000)}k` : `~${n}`
+}
+
+// What a tool call is about, in a few words: its file, command or pattern.
+function callLabel(tool: string, input: unknown) {
+  const i = (input ?? {}) as Record<string, unknown>
+  const about = [i.file_path, i.path, i.command, i.pattern, i.url, i.description, i.query].find(
+    v => typeof v === 'string' && v,
+  ) as string | undefined
+  if (!about) return tool
+  const short = about.replace(/\s+/g, ' ')
+  return `${tool} ${short.length > 60 ? short.slice(0, 59) + '…' : short}`
+}
+
+// A content block's size in characters, media at a flat estimate.
+function blockChars(v: unknown): number {
+  if (typeof v === 'string') return v.length
+  if (Array.isArray(v)) return v.reduce((n: number, b) => n + blockChars(b), 0)
+  if (!v || typeof v !== 'object') return 0
+  const b = v as Record<string, unknown>
+  if (b.type === 'image' || b.type === 'document') return MEDIA_TOKENS * CHARS_PER_TOKEN
+  if (b.type === 'thinking') return typeof b.thinking === 'string' ? b.thinking.length : 0
+  if (b.type === 'redacted_thinking') return 0
+  if (typeof b.text === 'string') return b.text.length
+  if ('content' in b) return blockChars(b.content)
+  return JSON.stringify(b).length
+}
+
+// Where the live context goes, estimated from the messages the next request is
+// built from: the tools whose calls and results take the most, then the largest
+// single calls. The system prompt and tool schemas are left out: compacting
+// cannot shrink them.
+async function contextStats($: Engine) {
+  const messages = await $.session.messages({ as: 'api' })
+  const calls = new Map<string, { tool: string; label: string; chars: number }>()
+  let conversation = 0
+  for (const m of messages) {
+    for (const b of m.content) {
+      if (b.type === 'tool_use') {
+        const tool = String(b.name)
+        calls.set(String(b.id), { tool, label: callLabel(tool, b.input), chars: JSON.stringify(b.input ?? {}).length })
+      } else if (b.type === 'tool_result') {
+        const call = calls.get(String(b.tool_use_id))
+        if (call) call.chars += blockChars(b.content)
+        else conversation += blockChars(b.content)
+      } else conversation += blockChars(b)
+    }
+  }
+  const byTool = new Map<string, { chars: number; n: number }>()
+  for (const c of calls.values()) {
+    const t = byTool.get(c.tool) ?? { chars: 0, n: 0 }
+    byTool.set(c.tool, { chars: t.chars + c.chars, n: t.n + 1 })
+  }
+  const groups = [
+    ...[...byTool].map(([tool, t]) => ({ chars: t.chars, text: `${tool} ${tokens(t.chars)} (${t.n} call${t.n === 1 ? '' : 's'})` })),
+    { chars: conversation, text: `conversation text ${tokens(conversation)}` },
+  ]
+    .sort((a, b) => b.chars - a.chars)
+    .slice(0, NUDGE_TOP)
+    .map(g => g.text)
+  const largest = [...calls.values()]
+    .sort((a, b) => b.chars - a.chars)
+    .slice(0, NUDGE_TOP)
+    .map(c => `${c.label} ${tokens(c.chars)}`)
+  return (
+    `Estimated by what fills it: ${groups.join(', ')}.` +
+    (largest.length ? ` Largest single tool calls: ${largest.join('; ')}.` : '')
+  )
+}
+
+// The limits from the options, set when the module registers; a session's own
+// override each.
+let defaults: Limits = { interval: 10, max: 0, resumes: 3, nudge: 30, every: 10 }
+const limitsOf = (s: Session): Limits => ({ ...defaults, ...s.limits })
+
+// Why a new request would be refused now, if it would.
+function refusal(s: Session, limits: Limits, now: number) {
+  const since = now - s.lastAt
+  if (limits.max && s.count >= limits.max)
+    return `refused: ${s.count} self-compactions in this session already (max ${limits.max})`
+  if (since < limits.interval * 60_000)
+    return `refused: last self-compaction ${Math.round(since / 1000)} s ago (min ${limits.interval * 60} s)`
+  return undefined
+}
+
+// The nudge due at the context's current fill, or undefined.
+async function nudge($: Engine) {
+  if (pending || running) return undefined
+  const percent = (await $.session.usage()).context.percent
+  if (percent === undefined) return undefined
+  const s = await getSession($)
+  const l = limitsOf(s)
+  if (!l.nudge || percent < l.nudge) return undefined
+  const every = Math.max(1, l.every)
+  const step = l.nudge + Math.floor((percent - l.nudge) / every) * every
+  if (step <= s.nudgedAt || refusal(s, l, await $.clock.now())) return undefined
+  await putSession($, { ...s, nudgedAt: step })
+  const stats = await contextStats($).catch(() => undefined)
+  await log($, `nudged at ${percent}% of the context`)
+  return join(
+    `self-compact: your context window is ${percent}% full. If you don't need everything ` +
+      'that is in it, consider compacting with request_compaction to stay sharp (durable ' +
+      'state in files first; `carry` and `resume` keep the exact next step). If you ' +
+      'genuinely need all the files and outputs in context to continue the task, skip this.',
+    stats,
+  )
+}
+
 export const register: Register = (on, options) => {
   const alwaysInstructions = str(options.alwaysInstructions, MAX_TEXT)
   const alwaysCarry = str(options.alwaysCarry, MAX_TEXT)
   const num = (v: unknown, dflt: number) => Math.max(0, Number(v ?? dflt) || 0)
-  const defaults: Limits = {
+  defaults = {
     interval: num(options.minIntervalMinutes, 10),
     max: num(options.maxCompactions, 0),
     resumes: num(options.maxResumes, 3),
+    nudge: num(options.nudgeFromPercent, 30),
+    every: num(options.nudgeEveryPercent, 10),
   }
-  const limitsOf = (s: Session): Limits => ({ ...defaults, ...s.limits })
-
   const describe = (s: Session) => {
     const l = limitsOf(s)
     const mark = (k: keyof Limits) => (k in s.limits ? ' (this session)' : '')
@@ -257,6 +386,8 @@ export const register: Register = (on, options) => {
       `max: ${l.max ? `${l.max} self-compactions` : 'no limit'}${mark('max')}, ${s.count} so far`,
       `resumes: ${l.resumes ? `${l.resumes} in a row` : 'off'}${mark('resumes')}, ` +
         `${s.resumes} since your last prompt`,
+      `nudge: ${l.nudge ? `from ${l.nudge}% of the context` : 'off'}${mark('nudge')}, ` +
+        `every ${Math.max(1, l.every)}%${mark('every')}`,
     ].join('\n')
   }
 
@@ -297,7 +428,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: COMMAND,
       description: "Show or set this session's self-compact limits",
-      argumentHint: '[interval <min>] [max <n>] [resumes <n>] | reset',
+      argumentHint: '[interval <min>] [max <n>] [resumes <n>] [nudge <%>] [every <%>] | reset',
       immediate: true,
     })
     return started
@@ -314,12 +445,7 @@ export const register: Register = (on, options) => {
     const s = await getSession($)
     const limits = limitsOf(s)
     if (!replaced) {
-      const since = (await $.clock.now()) - s.lastAt
-      let why: string | undefined
-      if (limits.max && s.count >= limits.max)
-        why = `refused: ${s.count} self-compactions in this session already (max ${limits.max})`
-      else if (since < limits.interval * 60_000)
-        why = `refused: last self-compaction ${Math.round(since / 1000)} s ago (min ${limits.interval * 60} s)`
+      const why = refusal(s, limits, await $.clock.now())
       if (why) {
         await log($, why)
         return { result: `Not scheduled (${why}). The user can change the limit with /${COMMAND}.` }
@@ -373,20 +499,28 @@ export const register: Register = (on, options) => {
     return { result: 'Compaction cancelled.' }
   }).catch(() => ({ result: 'self-compact failed internally; the request may still be scheduled.' }))
 
+  // After each of the main loop's tool calls, a due nudge rides along with the
+  // result. No .catch fallback: it would run the tool a second time.
+  on('tool.call', async ($, e, next) => {
+    const res = await next(e)
+    if (e.agentId !== undefined || res.deny !== undefined || [FULL, CANCEL_FULL].includes(e.tool)) return res
+    const note = await nudge($).catch(() => undefined)
+    return note ? { ...res, context: [...(res.context ?? []), note] } : res
+  })
+
   // Only the person's own command changes the limits: the model must not lift
   // the limits that bound it.
   on('command.run', { command: COMMAND }, async ($, e) => {
     const s = await getSession($)
     const args = e.args ?? ''
-    if (!args.trim()) return { text: `self-compact limits for this session:\n${describe(s)}` }
-    if (!e.origin || !HUMAN.includes(e.origin.kind)) return { text: `self-compact: only you can change the limits.` }
+    if (!args.trim()) return { text: `limits for this session:\n${describe(s)}` }
+    if (!e.origin || !HUMAN.includes(e.origin.kind)) return { text: 'only you can change the limits.' }
     const parsed = parseLimits(args)
-    if (typeof parsed === 'object' && 'error' in parsed)
-      return { text: `self-compact: ${parsed.error}. Usage: /${COMMAND} [interval <min>] [max <n>] [resumes <n>] | reset` }
+    if (typeof parsed === 'object' && 'error' in parsed) return { text: `${parsed.error}. Usage: ${USAGE}` }
     const next: Session = { ...s, limits: parsed === 'reset' ? {} : { ...s.limits, ...parsed } }
     await putSession($, next)
     await log($, `limits ${parsed === 'reset' ? 'reset' : `set: ${JSON.stringify(parsed)}`}`)
-    return { text: `self-compact limits for this session:\n${describe(next)}` }
+    return { text: `limits for this session:\n${describe(next)}` }
   })
 
   // Every compaction of the main conversation: add the configured instructions on
@@ -400,13 +534,16 @@ export const register: Register = (on, options) => {
     if (res.skip !== undefined) return res
     const carry = join(alwaysCarry, job && jobCarry(job))
     if (job) job.carried = true
+    const s = await getSession($).catch(() => undefined)
+    if (s?.nudgedAt) await putSession($, { ...s, nudgedAt: 0 }).catch(() => {})
     const sizes = res.tokensBefore ? ` ${res.tokensBefore} -> ${res.tokensAfter ?? '?'} tokens` : ''
     await log($, `compacted (${e.trigger}${job ? ', self' : ''})${sizes}${carry ? `; carried ${carry.length} chars` : ''}`)
       .catch(() => {})
     return carry ? { ...res, messages: [...res.messages, carryMessage(carry)] } : res
   })
 
-  // The person's own prompt resets the count of resumes in a row. A prompt that
+  // The person's own prompt resets the count of resumes in a row, and carries a
+  // due nudge. A prompt that
   // starts a turn before the compaction did: tell the model the request is still
   // pending (its carry and resume were written before this prompt).
   on('prompt.submit', async ($, e, next) => {
@@ -414,7 +551,10 @@ export const register: Register = (on, options) => {
       const s = await getSession($)
       if (s.resumes) await putSession($, { ...s, resumes: 0 })
     }
-    if (!pending || running) return next(e)
+    if (!pending || running) {
+      const note = await nudge($).catch(() => undefined)
+      return next(note ? { ...e, context: [...(e.context ?? []), note] } : e)
+    }
     await log($, 'a prompt started a turn first; the request stays pending')
     return next({ ...e, context: [...(e.context ?? []), PENDING_NOTE] })
   }).catch(($, e, next) => next(e))

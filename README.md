@@ -54,14 +54,29 @@ What you see: a `/compact` row with the instructions, the usual "Compacted" line
 `resume`) "The self-compact plugin sent a message" starting the next turn. The earlier chat
 stays visible.
 
+## Nudge
+
+Once the context window is `nudgeFromPercent` full (30% by default), and again at each further
+`nudgeEveryPercent` (10%), Claude reads a note beside its next tool result, or your next prompt,
+suggesting a self-compaction unless it genuinely needs everything in context. The note
+estimates what fills the context: the tools whose calls and results take the most, and the
+largest single calls, e.g.
+
+> Estimated by what fills it: Read ~42k (31 calls), Bash ~18k (12 calls), conversation text
+> ~9k. Largest single tool calls: Read /repo/flake.lock ~8k; Bash nix build … ~5k; …
+
+Any compaction starts the steps over. There is no nudge while a compaction is pending or while
+a request would be refused by the limits below.
+
 ## Limits
 
 Three limits bound how far Claude can drive itself, each an option below and each overridable
-for the current session:
+for the current session, as are the nudge's two:
 
 ```
 /self-compact                                 show this session's limits and counts
 /self-compact interval 5 max 3 resumes 1      set any of them for this session
+/self-compact nudge 40 every 5                move the nudge (nudge 0: off)
 /self-compact reset                           back to the options
 ```
 
@@ -86,6 +101,8 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 | `minIntervalMinutes` | 10 | The tool refuses a new request within this many minutes of the last self-compaction in the same session. |
 | `maxCompactions` | 0 | The tool refuses once the session self-compacted this many times (0: no limit). |
 | `maxResumes` | 3 | Resumes in a row without a prompt from you; past it the resume is withheld (0: resume is off). |
+| `nudgeFromPercent` | 30 | Context fill at which the nudge starts (0: off). |
+| `nudgeEveryPercent` | 10 | Further nudge at each step of this many percent. |
 
 ## How it works
 

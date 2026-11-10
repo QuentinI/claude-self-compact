@@ -28,6 +28,8 @@ function world(on: On, store: Record<string, unknown> = {}, live = false) {
     hold: false, // the plugin's own prompts wait (the session never goes idle)
     compacts: 0,
     clock: mock.clock(on, { now: 1_000_000_000 }),
+    percent: undefined as number | undefined, // the context window's fill
+    api: [] as { role: 'user' | 'assistant'; content: { type: string; [k: string]: unknown }[] }[],
   }
   if (live) liveStore(on, store)
   else mock.store(on, store)
@@ -52,7 +54,11 @@ function world(on: On, store: Record<string, unknown> = {}, live = false) {
     return { text: '' }
   })
   on('session.id', () => ({ value: 'S1' }))
-  on('session.messages', () => ({ value: [summary] }))
+  on('session.messages', ($, e) => ({ value: e.as === 'api' ? seen.api : [summary] }) as never)
+  on('session.usage', () => ({
+    value: { startedAt: 0, rateLimits: [], context: { window: 1_000_000, percent: seen.percent } },
+  }))
+  on('tool.call', { tool: 'Read' }, () => ({ result: { type: 'text' } }) as never)
   mock.env(on, { HOME: '/nonexistent-home' })
   on('session.compact', ($, e) => {
     seen.compacts++
@@ -260,4 +266,65 @@ test('the person sets and resets per-session limits with /self-compact', { optio
   expect(bad.text).toContain('max needs a number of 0 or more')
   const reset = await run('reset')
   expect(reset.text).toContain('interval: 10 min between self-compactions\n')
+})
+
+// A Read call and its result, as the next request carries them.
+const read = (id: string, path: string, chars: number) => [
+  { role: 'assistant' as const, content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: path } }] },
+  { role: 'user' as const, content: [{ type: 'tool_result', tool_use_id: id, content: 'x'.repeat(chars) }] },
+]
+const readCall = ($: Parameters<TestBody>[0]) =>
+  $.tool.call({ tool: 'Read', file_path: '/f', tool_use_id: 'r' } as never) as Promise<{ context?: string[] }>
+
+test('a nudge rides along with a tool result from the threshold on, once per step, with stats', async ($, on) => {
+  const seen = world(on)
+  seen.api = [...read('a', '/big/flake.lock', 80_000), ...read('b', '/small', 4_000)]
+  seen.percent = 25
+  expect((await readCall($)).context ?? []).toEqual([])
+  seen.percent = 34
+  const first = (await readCall($)).context?.join('\n') ?? ''
+  expect(first).toContain('34% full')
+  expect(first).toContain('skip this')
+  expect(first).toContain('Read ~21k (2 calls)')
+  expect(first).toContain('Read /big/flake.lock ~20k')
+  seen.percent = 38
+  expect((await readCall($)).context ?? []).toEqual([])
+  seen.percent = 41
+  expect((await readCall($)).context?.join() ?? '').toContain('41% full')
+})
+
+test('a compaction starts the nudge steps over', { options: { minIntervalMinutes: 0 } }, async ($, on) => {
+  const seen = world(on)
+  seen.percent = 45
+  expect((await readCall($)).context?.join() ?? '').toContain('45% full')
+  await $.session.compact({ trigger: 'manual', messages: [hello] })
+  expect((await readCall($)).context?.join() ?? '').toContain('45% full')
+})
+
+test('no nudge while a request would be refused, or with nudge 0', { options: { nudgeFromPercent: 0 } }, async ($, on) => {
+  const seen = world(on)
+  seen.percent = 90
+  expect((await readCall($)).context ?? []).toEqual([])
+})
+
+test('no nudge within the interval', async ($, on) => {
+  const seen = world(on, { 'session:S1': { lastAt: 1_000_000_000 - 60_000, count: 1 } })
+  seen.percent = 90
+  expect((await readCall($)).context ?? []).toEqual([])
+})
+
+test('the person\'s prompt carries a due nudge', async ($, on) => {
+  const seen = world(on)
+  seen.percent = 50
+  await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as never)
+  expect(seen.prompts[0]?.context?.join() ?? '').toContain('50% full')
+})
+
+test('/self-compact sets the nudge, and leaves the plugin name to the engine', async ($, on) => {
+  world(on)
+  const res = await $.command.run({ command: 'self-compact', args: 'nudge 40 every 5', origin: { kind: 'composer' } } as never)
+  expect(res.text).toContain('nudge: from 40% of the context (this session), every 5% (this session)')
+  expect(res.text?.startsWith('self-compact')).toBe(false)
+  const bare = await $.command.run({ command: 'self-compact', args: '0 100', origin: { kind: 'composer' } } as never)
+  expect(bare.text).toContain('unknown limit "0"')
 })

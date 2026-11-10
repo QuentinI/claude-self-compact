@@ -1,6 +1,6 @@
 {
   "name": "self-compact",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Lets Claude compact its own context (a real /compact: the chat history stays visible), carry text verbatim across it and resume itself",
   "author": {
     "name": "Moritz Hoffmann",
@@ -36,6 +36,18 @@
       "title": "Maximum resumes in a row",
       "description": "How many self-compactions in a row may start the next turn with `resume` before a prompt from you; past it the resume is withheld and the session waits for you. 0 turns resume off. /self-compact resumes <n> overrides it for one session.",
       "default": 3
+    },
+    "nudgeFromPercent": {
+      "type": "number",
+      "title": "Nudge from (% of the context)",
+      "description": "Once the context window is this full, Claude reads a note beside its next tool result suggesting a self-compaction, with an estimate of what fills the context; 0 turns the nudge off. /self-compact nudge <%> overrides it for one session.",
+      "default": 30
+    },
+    "nudgeEveryPercent": {
+      "type": "number",
+      "title": "Nudge again every (% of the context)",
+      "description": "After the first nudge, another at each further step of this many percent; any compaction starts over. /self-compact every <%> overrides it for one session.",
+      "default": 10
     }
   },
   "homepage": "https://github.com/xuio/claude-self-compact",
