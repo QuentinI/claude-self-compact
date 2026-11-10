@@ -1,6 +1,6 @@
 {
   "name": "self-compact",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Lets Claude compact its own context (a real /compact: the chat history stays visible), carry text verbatim across it and resume itself",
   "author": {
     "name": "Moritz Hoffmann",
@@ -22,8 +22,20 @@
     "minIntervalMinutes": {
       "type": "number",
       "title": "Minimum minutes between self-compactions",
-      "description": "The request_compaction tool refuses a new request within this many minutes of the last self-compaction in the same session.",
+      "description": "The request_compaction tool refuses a new request within this many minutes of the last self-compaction in the same session. /self-compact interval <min> overrides it for one session.",
       "default": 10
+    },
+    "maxCompactions": {
+      "type": "number",
+      "title": "Maximum self-compactions per session",
+      "description": "The request_compaction tool refuses once a session has self-compacted this many times; 0 means no limit. /self-compact max <n> overrides it for one session.",
+      "default": 0
+    },
+    "maxResumes": {
+      "type": "number",
+      "title": "Maximum resumes in a row",
+      "description": "How many self-compactions in a row may start the next turn with `resume` before a prompt from you; past it the resume is withheld and the session waits for you. 0 turns resume off. /self-compact resumes <n> overrides it for one session.",
+      "default": 3
     }
   },
   "homepage": "https://github.com/xuio/claude-self-compact",

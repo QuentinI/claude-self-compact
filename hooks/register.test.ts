@@ -90,7 +90,7 @@ test('a replacement is not refused by minIntervalMinutes', { options: { minInter
   const store: Record<string, unknown> = {}
   world(on, store, true)
   await $.tool.call({ tool: TOOL } as never)
-  store.lastAt = { S1: 1_000_000_000 }
+  store['session:S1'] = { lastAt: 1_000_000_000, count: 1 }
   const res = await $.tool.call({ tool: TOOL, carry: 'y' } as never)
   expect(JSON.stringify(res)).toContain('request replaced')
 })
@@ -107,13 +107,13 @@ test('cancel_compaction drops the request', async ($, on) => {
 })
 
 test('the tool refuses within minIntervalMinutes of the last self-compaction', { options: { minIntervalMinutes: 10 } }, async ($, on) => {
-  world(on, { lastAt: { S1: 1_000_000_000 - 60_000 } })
+  world(on, { 'session:S1': { lastAt: 1_000_000_000 - 60_000, count: 1 } })
   const res = await $.tool.call({ tool: TOOL } as never)
   expect(JSON.stringify(res)).toContain('Not scheduled')
 })
 
 test("another session's compaction does not count", async ($, on) => {
-  world(on, { lastAt: { S2: 1_000_000_000 - 60_000 } })
+  world(on, { 'session:S2': { lastAt: 1_000_000_000 - 60_000, count: 1 } })
   const res = await $.tool.call({ tool: TOOL } as never)
   expect(JSON.stringify(res)).toContain('Compaction scheduled')
 })
@@ -160,7 +160,7 @@ test('a deferred request runs when the other turn ends, then resumes', async ($,
   await $.turn.complete(ended('T2'))
   await seen.clock.settle()
   expect(seen.compacts).toBe(1)
-  expect(seen.prompts.map(p => p.text.split('\n')[0])).toEqual(['queued-test', 'go on'])
+  expect(seen.prompts.map(p => p.text)).toEqual(['queued-test', expect.stringContaining('self-compact-carry')])
 })
 
 // A subagent message queued during the compaction starts the next turn; the
@@ -181,13 +181,83 @@ test('the resume text is carried and a waiting resume prompt blocks nothing', as
   expect(JSON.stringify(again)).toContain('Compaction scheduled')
 })
 
-test('a misspelled field is refused, not dropped', async ($, on) => {
+test('an unknown field is named in the answer, and the request still scheduled', async ($, on) => {
   const seen = world(on)
-  const bad = await $.tool.call({ tool: TOOL, carry: 'c', resume_prompt: 'go on' } as never)
-  expect(JSON.stringify(bad)).toContain('unknown field resume_prompt')
-  const none = await $.tool.call({ tool: CANCEL } as never)
-  expect(JSON.stringify(none)).toContain('Nothing to cancel')
-  const ok = await $.tool.call({ tool: TOOL, carry: 'c' } as never)
-  expect(JSON.stringify(ok)).toContain('no resume')
-  expect(seen.logs.some(l => l.text.includes('refused: unknown field'))).toBe(true)
+  const res = await $.tool.call({ tool: TOOL, carry: 'c', resume_prompt: 'go on' } as never)
+  expect(JSON.stringify(res)).toContain('Compaction scheduled')
+  expect(JSON.stringify(res)).toContain('ignored unknown field resume_prompt')
+  expect(JSON.stringify(res)).toContain('no resume')
+  expect(seen.logs.some(l => l.text.includes('ignored resume_prompt'))).toBe(true)
+})
+
+// The step itself lives in the carry alone; the queued prompt only points at it.
+test('the resume step is delivered once, in the carry', async ($, on) => {
+  const seen = world(on)
+  await $.turn.start({ turnId: 'T1', text: 'work' })
+  await $.tool.call({ tool: TOOL, resume: 'add the row' } as never)
+  await $.turn.complete(ended('T1'))
+  await seen.clock.settle()
+  expect(seen.prompts.length).toBe(1)
+  expect(seen.prompts[0]?.text).not.toContain('add the row')
+})
+
+test('maxCompactions refuses once the session used them', { options: { maxCompactions: 2, minIntervalMinutes: 0 } }, async ($, on) => {
+  world(on, { 'session:S1': { count: 2 } })
+  const res = await $.tool.call({ tool: TOOL } as never)
+  expect(JSON.stringify(res)).toContain('2 self-compactions in this session already (max 2)')
+})
+
+test('a per-session limit overrides the option', { options: { maxCompactions: 0 } }, async ($, on) => {
+  world(on, { 'session:S1': { count: 1, limits: { max: 1 } } })
+  const res = await $.tool.call({ tool: TOOL } as never)
+  expect(JSON.stringify(res)).toContain('(max 1)')
+})
+
+test('resume is withheld after maxResumes in a row, and a prompt from the person resets it', { options: { maxResumes: 1, minIntervalMinutes: 0 } }, async ($, on) => {
+  const store: Record<string, unknown> = { 'session:S1': { resumes: 1 } }
+  world(on, store, true)
+  const held = await $.tool.call({ tool: TOOL, resume: 'go on' } as never)
+  expect(JSON.stringify(held)).toContain('resume withheld')
+  await $.tool.call({ tool: CANCEL } as never)
+  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+  expect((store['session:S1'] as { resumes: number }).resumes).toBe(0)
+  const ok = await $.tool.call({ tool: TOOL, resume: 'go on' } as never)
+  expect(JSON.stringify(ok)).toContain('resume 5 chars')
+})
+
+test('maxResumes 0 turns resume off', { options: { maxResumes: 0 } }, async ($, on) => {
+  world(on)
+  const res = await $.tool.call({ tool: TOOL, resume: 'go on' } as never)
+  expect(JSON.stringify(res)).toContain('resume is off')
+})
+
+test('/self-compact shows the limits; a plugin cannot change them', { options: { maxResumes: 3 } }, async ($, on) => {
+  world(on)
+  const shown = await $.command.run({ command: 'self-compact' } as never)
+  expect(shown.text).toContain('resumes: 3 in a row')
+  const refused = await $.command.run({ command: 'self-compact', args: 'max 100' } as never)
+  expect(refused.text).toContain('only you can change the limits')
+})
+
+test('a dropped request is reported in the transcript', async ($, on) => {
+  const seen = world(on)
+  await $.turn.start({ turnId: 'T1', text: 'work' })
+  await $.tool.call({ tool: TOOL } as never)
+  await $.turn.complete({ ...ended('T1'), reason: 'error' } as never)
+  expect(seen.logs.some(l => l.to === 'transcript' && l.text.includes('dropped'))).toBe(true)
+})
+
+test('the person sets and resets per-session limits with /self-compact', { options: { minIntervalMinutes: 10 } }, async ($, on) => {
+  const store: Record<string, unknown> = {}
+  world(on, store, true)
+  const run = (args: string) =>
+    $.command.run({ command: 'self-compact', args, origin: { kind: 'composer' } } as never)
+  const set = await run('interval 0 max 1 resumes 0')
+  expect(set.text).toContain('interval: 0 min between self-compactions (this session)')
+  expect(set.text).toContain('max: 1 self-compactions (this session)')
+  expect(set.text).toContain('resumes: off (this session)')
+  const bad = await run('max -1')
+  expect(bad.text).toContain('max needs a number of 0 or more')
+  const reset = await run('reset')
+  expect(reset.text).toContain('interval: 10 min between self-compactions\n')
 })

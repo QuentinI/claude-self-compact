@@ -17,7 +17,7 @@ Works in the terminal and in the **Claude desktop app's Code tab** (an SDK-hoste
 In a terminal Claude Code session:
 
 ```
-/plugin install self-compact --marketplace xuio/claude-self-compact
+/plugin install self-compact --marketplace QuentinI/claude-self-compact
 ```
 
 Answer `y` to add the marketplace, then pick a scope (user scope loads it in every session,
@@ -38,10 +38,11 @@ can still be listed as deferred; Claude then loads their schema with ToolSearch 
 | --- | --- |
 | `instructions` | What the summary must keep or stress (the text after `/compact`). |
 | `carry` | Text placed **verbatim** after the summary, never summarized: ids, paths, branch names, the exact next step. |
-| `resume` | A prompt that starts Claude's next turn after the compaction. Omit it to wait for the user. |
+| `resume` | The next step to start on after the compaction. It is carried after the summary, and a fixed prompt pointing at it starts the next turn. Omit it to wait for the user. |
 
-Any other field is refused (nothing is scheduled), so a misspelled `resume` is not silently
-dropped; the tool's answer lists what was scheduled.
+Any other field is ignored and named in the tool's answer, which also lists what was
+scheduled, so a misspelled `resume` is not silently dropped: Claude can call again with the
+right field.
 
 A prompt that makes use of it:
 
@@ -53,6 +54,27 @@ What you see: a `/compact` row with the instructions, the usual "Compacted" line
 `resume`) "The self-compact plugin sent a message" starting the next turn. The earlier chat
 stays visible.
 
+## Limits
+
+Three limits bound how far Claude can drive itself, each an option below and each overridable
+for the current session:
+
+```
+/self-compact                                 show this session's limits and counts
+/self-compact interval 5 max 3 resumes 1      set any of them for this session
+/self-compact reset                           back to the options
+```
+
+- `interval`: minutes between self-compactions.
+- `max`: self-compactions in the session (0: no limit).
+- `resumes`: self-compactions in a row that may start the next turn with `resume` before a
+  prompt from you (0: resume is off). Past it, the compaction still runs but the resume is
+  withheld (the tool's answer says so) and the session waits for you. Your own prompt resets
+  the count.
+
+Only a command you run yourself (typed, from the bridge or the SDK host) changes the limits; a
+plugin running `/self-compact` can only show them.
+
 ## Options
 
 Set with `/config` (or `pluginConfigs` in `settings.json`):
@@ -62,6 +84,8 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 | `alwaysInstructions` | empty | Added to the summarizer's instructions on **every** compaction of the main conversation: a typed `/compact` and auto-compaction too. |
 | `alwaysCarry` | empty | Placed verbatim after the summary on **every** compaction, e.g. `Re-read docs/HANDOFF.md before continuing.` |
 | `minIntervalMinutes` | 10 | The tool refuses a new request within this many minutes of the last self-compaction in the same session. |
+| `maxCompactions` | 0 | The tool refuses once the session self-compacted this many times (0: no limit). |
+| `maxResumes` | 3 | Resumes in a row without a prompt from you; past it the resume is withheld (0: resume is off). |
 
 ## How it works
 
@@ -73,10 +97,11 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 3. A `session.compact` hook adds `alwaysInstructions` on the way down and appends the carried
    text after the summary on the way up; if that hook did not see the compaction, the text is
    appended with `$.session.append` instead.
-4. `resume` is queued with `$.prompt.submit` and starts the next turn once the session is idle.
-   Messages queued during the compaction (a subagent's message, a task notification) go
-   first, so the resume text is also placed after the summary with the carried text: Claude
-   reads it before whichever message starts the next turn.
+4. The `resume` step is placed after the summary with the carried text, and a fixed prompt
+   pointing at it is queued with `$.prompt.submit`; it starts the next turn once the session
+   is idle. Messages queued during the compaction (a subagent's message, a task notification)
+   go first, but Claude reads the step before whichever message starts the next turn. The
+   step itself is delivered once, so a step with side effects is not invited twice.
 
 If a prompt starts a turn before the compaction does (the desktop app sends a message typed
 during the turn right after the turn ends), the request stays pending and the compaction runs
@@ -84,10 +109,12 @@ when that turn ends. Beside that prompt Claude reads a note that the compaction 
 yet, so it can replace the request (its `carry` and `resume` were written before the message)
 or cancel it.
 
-Guards: one request at a time; the minimum interval (kept per session in the plugin store, so
-a reload does not reset it); a turn the user stopped drops the request; subagents' compactions
-are left alone. Every decision is logged to `~/.claude/self-compact/mod.log` (last 400 lines)
-and the debug log; only failures show in the transcript.
+Guards: one request at a time; the limits above (counters kept per session in the plugin
+store, so a reload does not reset them); a turn the user stopped drops the request quietly,
+and one that ended in an error or a refusal drops it with a line in the transcript; subagents'
+compactions are left alone. Every decision is logged to
+`~/.claude/self-compact/<session id>.log` (last 400 lines) and the debug log; only failures
+show in the transcript.
 
 ## Develop
 
